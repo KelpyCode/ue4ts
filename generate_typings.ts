@@ -41,7 +41,7 @@ function getMappedType(type: string): string {
     const regex = /fun\((.*?)\)/gm
     const match = regex.exec(type);
     if (match) {
-      if(!match[1]) return "() => any"
+      if (!match[1]) return "() => any"
       const args = match[1].split(",").map(arg => arg.trim().split(":").map(a => a.trim()));
 
       let str = "(";
@@ -55,7 +55,14 @@ function getMappedType(type: string): string {
     }
   }
 
-  if(HARD_MAP[type]) {
+  if (type?.endsWith("?")) {
+    if (HARD_MAP[type]) {
+      return HARD_MAP[type] + " | null"
+    }
+    return type.slice(0, -1) + " | null"
+  }
+
+  if (HARD_MAP[type]) {
     return HARD_MAP[type]
   }
   return type
@@ -66,14 +73,14 @@ function getMappedTypes(types: string): string[] {
 }
 
 
-function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: Map<string, string>) {
+function generateDefinitions(luaFilePath: string) {
   const definitions = new Map<string, DefinitionEntry>();
 
   const luaContent = fs.readFileSync(luaFilePath, "utf-8");
   const lines = luaContent.split("\n");
 
-  let result = "";
   let insideType = false;
+  let insideFn = false;
   let currentDefinition: Partial<DefinitionEntry> = generateDefault();
   let usedTypes = new Set<string>();
 
@@ -93,7 +100,7 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
           definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
           currentDefinition = generateDefault();
         }
-        
+
         const regex = /\s+(\w+)(?:<([\w, ]+?)>)/gm
         const match = regex.exec(line);
         if (match) {
@@ -155,7 +162,16 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
         }
 
       } else if (def === "@return") {
-        const l = line.substring("---@return".length).split(", ")
+        let line2 = line.substring("---@return".length)
+        // Remove  everything after # (comment)
+        const index = line2.indexOf("#");
+        if (index !== -1) {
+          line2 = line2.substring(0, index);
+        }
+        line2 = line2.trim();
+
+
+        const l = line2.split(", ")
         l.forEach(t => usedTypes.add(getMappedType(t)))
         if (l.length > 1) {
           currentDefinition.returnType = "[" + l.map(t => getMappedType(t.trim())).join(", ") + "]";
@@ -174,13 +190,23 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
     } else {
       if (line.trim().length === 0) continue
 
-      console.log(line)
+      if (insideFn && line.startsWith("end")) {
+        insideFn = false;
+        if (currentDefinition.name) {
+          currentDefinition.type = "function";
+          definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+          currentDefinition = generateDefault();
+        }
+        continue
+      } else if (insideFn) {
+        continue
+      }
 
 
       // Finish type definition
       if (insideType && line.trim() === "}") {
         insideType = false;
-        if(currentDefinition.name) {
+        if (currentDefinition.name) {
           definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
           currentDefinition = generateDefault();
         }
@@ -205,6 +231,8 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
         insideType = !autoCloses
         currentDefinition.name = match[1];
         if (autoCloses) {
+          if(!currentDefinition.type)
+            currentDefinition.type = "class";
           definitions.set(currentDefinition.name, currentDefinition as DefinitionEntry);
           currentDefinition = generateDefault();
         }
@@ -212,11 +240,17 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
       }
 
       // function something(...) end | something['name'] = function(...) end
-      regex = /(?:function *([\w]+)(?:(?::|.)([\w]+))?\(.*?\) *end|([\w]+)\['(.+?)'] = function\(.+?\) * end)/gm
+      regex = /(?:function *([\w]+)(?:(?::|\.)([\w]+))?\(.*?\) *(?:end)?|([\w]+)\['(.+?)'] = function\(.+?\) * (?:end)?)/gm
       match = regex.exec(line);
       if (match) {
         let _class = match[1] || match[3];
         let fnName = match[2] || match[4];
+        let end = line.trim().endsWith(" end")
+
+        if (!end) {
+          insideFn = true
+        }
+
         let _static = !line.includes(":") || _class === undefined;
 
         if (_class && fnName) {
@@ -224,7 +258,7 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
           currentDefinition.type = "function";
           currentDefinition.static = _static;
 
-          definitions.set(currentDefinition.name, currentDefinition as DefinitionEntry);
+          handleDuplicateFns(definitions, currentDefinition);
           currentDefinition = generateDefault();
           continue;
         } else if (!fnName && _class) {
@@ -232,7 +266,7 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
           currentDefinition.type = "function";
           currentDefinition.static = _static;
 
-          definitions.set(currentDefinition.name, currentDefinition as DefinitionEntry);
+          handleDuplicateFns(definitions, currentDefinition);
           currentDefinition = generateDefault();
           continue;
         }
@@ -256,23 +290,52 @@ function parseLuaToTypeScript(luaFilePath: string, outputDir: string, typeMap: M
       }
 
 
-      throw new Error(`Unhandled line: ${line}`);
+      console.warn(`Unhandled line: ${line}`);
+      // throw new Error(`Unhandled line: ${line}`);
     }
 
 
   }
-  definitions.forEach(def => {
-    result += definitionToTypeScript(def, definitions)
-  })
-
-  // Write the result to a .d.ts file
-  const relativePath = path.relative(path.join(import.meta.dirname!, "shared"), luaFilePath);
-  const outputFilePath = path.join("tstypes", relativePath.replace(/\.lua$/, ".d.ts"));
-  fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
-  fs.writeFileSync(outputFilePath, result, "utf-8");
-  console.log(`🟢 ${outputFilePath}`);
+  return { definitions, usedTypes }
 }
 
+
+
+
+function handleDuplicateFns(definitions: Map<string, DefinitionEntry>, currentDefinition: Partial<DefinitionEntry>) {
+  const existing = definitions.get(currentDefinition.name!);
+  if (existing) {
+    // Merge params (fields)
+    const newTypes = [] as FieldEntry[];
+    for (let i = 0; i < Math.max(currentDefinition.fields?.length ?? 0, existing.fields?.length ?? 0); i++) {
+      const field = currentDefinition.fields?.[i];
+      const existingField = existing.fields?.[i];
+
+      let types: string[] = [];
+
+      if (field?.types.length) {
+        types.push('(' + field?.types.join(" | ") + ")");
+      }
+
+      if (existingField?.types.length) {
+        types.push('(' + existingField?.types.join(" | ") + ")");
+      }
+
+      if (!existingField?.types.length || !field?.types.length) {
+        field!.name += "?"
+      }
+
+      newTypes.push({
+        name: field?.name && existingField?.name ? `${existingField?.name}_or_${field?.name}` : field?.name ?? existingField?.name ?? '__ERROR__',
+        types
+      });
+    }
+    currentDefinition.fields = newTypes;
+    definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+  } else {
+    definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+  }
+}
 
 function renderComments(comments: string[]): string {
   if (comments.length === 0) return ""
@@ -288,7 +351,7 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
   // }
   if (def.type === "class") {
     result += renderComments(def.comments ?? [])
-    result += `declare class ${def.name}`;
+    result += `export class ${def.name}`;
 
     if (!def.generics?.length) {
       // If extends has generics, add them to the class
@@ -297,7 +360,7 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
       if (match) {
         result += `<${match[1]}>`;
       }
-    } else if(!def.name.includes("<")) {
+    } else if (!def.name.includes("<")) {
       result += `<${def.generics!.join(", ")}>`;
     }
 
@@ -327,7 +390,7 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
     result += "}\n";
   } else if (def.type === "enum") {
     result += renderComments(def.comments ?? [])
-    result += `declare enum ${def.name} {\n`;
+    result += `export enum ${def.name} {\n`;
     if (def.enumEntires) {
       for (const [key, value] of def.enumEntires) {
         result += `  ${key} = ${value}\n`;
@@ -340,12 +403,12 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
 
     const args = def.fields?.map(f => f.name + ": " + f.types.join(" | ")).join(", ") ?? ""
 
-    result += `declare function ${def.name}(${args}): ${def.returnType ?? 'void'};\n`;
+    result += `export function ${def.name}(${args}): ${def.returnType ?? 'void'};\n`;
   } else if (def.type === "variable") {
     result += renderComments(def.comments ?? [])
-    result += `declare const ${def.name} = ${def.returnType};\n`;
+    result += `export const ${def.name} = ${def.returnType};\n`;
   } else if (def.type === "alias") {
-    result += `declare type ${def.name} = ${def.aliases!.map(alias => alias).join(" | ")};\n`;
+    result += `export type ${def.name} = ${def.aliases!.map(alias => alias).join(" | ")};\n`;
   } else {
     throw new Error(`Unhandled type conversion: ${def.type}`);
   }
@@ -354,23 +417,46 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
 }
 
 
-function generateTypeMap(sharedDir: string): Map<string, string> {
-  const typeMap = new Map<string, string>();
-  const files = glob("**/*.lua", { cwd: sharedDir });
+function parseLuaFile(luaFilePath: string, definitions: Map<string, DefinitionEntry>, usedType: Set<string>, definitionLocations: Map<string, string>) {
+  // let result = "declare global {\n";
+  let result = ""
 
-  files.forEach((file) => {
-    const filePath = path.join(sharedDir, file);
-    const luaContent = fs.readFileSync(filePath, "utf-8");
-    const classRegex = /---@class\s+(\w+)(?:<([\w, ]+?)>)?/g;
-    let match;
-    while ((match = classRegex.exec(luaContent)) !== null) {
-      const className = match[1];
-      const generics = match[2] ? match[2].split(",").map(g => g.trim()) : [];
-      typeMap.set(className, filePath);
+  // Generate imports
+  const types = [...usedType];
+  const importsMap = new Map<string, Set<string>>();
+
+  types.forEach(type => {
+    const location = definitionLocations.get(type);
+    if (location && location !== luaFilePath) {
+      const relativePath = path.relative(path.dirname(luaFilePath), location).replace(/\.lua$/, "");
+      if (!importsMap.has(relativePath)) {
+        importsMap.set(relativePath, new Set());
+      }
+      importsMap.get(relativePath)!.add(type);
     }
   });
 
-  return typeMap;
+  const imports = Array.from(importsMap.entries()).map(([relativePath, types]) => {
+    // return `import type { ${Array.from(types).join(", ")} } from "./${relativePath.replaceAll("\\","/")}.d.ts";`;
+    return `/// <reference path="./${relativePath.replaceAll("\\", "/")}.d.ts" />`;
+  });
+
+  result += imports.join("\n") + "\n\n";
+
+  result += "export {};\ndeclare global {\n";
+
+  definitions.forEach(def => {
+    result += definitionToTypeScript(def, definitions)
+  })
+
+  result += "}\n"
+  // result += "}\n\nexport {};\n";
+  // Write the result to a .d.ts file
+  const relativePath = path.relative(path.join(import.meta.dirname!, "shared"), luaFilePath);
+  const outputFilePath = path.join("tstypes", relativePath.replace(/\.lua$/, ".d.ts"));
+  fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
+  fs.writeFileSync(outputFilePath, result, "utf-8");
+  console.log(`🟢 ${outputFilePath}`);
 }
 
 // Define paths
@@ -378,14 +464,66 @@ const sharedDir = path.join(import.meta.dirname!, "shared");
 const outputDir = path.join(import.meta.dirname!, "tstypes");
 
 // Generate type map
-const typeMap = generateTypeMap(sharedDir);
+// const typeMap = generateTypeMap(sharedDir);
 
 // Process each Lua file
 // const luaFiles = glob("**/*.lua", { cwd: sharedDir });
-const luaFiles = glob("**/Types.lua", { cwd: sharedDir });
+const luaFiles = glob("**/*.lua", { cwd: sharedDir });
+const definitionLocations = new Map<string, string>();
+const locationDefinitions = new Map<string, Map<string, DefinitionEntry>>();
+const locationUsedTypes = new Map<string, Set<string>>();
+
+console.time("⭕ Processing Lua files");
+luaFiles.forEach((file) => {
+  try {
+    const baseDir = import.meta.dirname!;
+    const luaFilePath = path.join(sharedDir, file);
+
+    console.time(`🔵 Processing ${file}`);
+
+    const { definitions: defs, usedTypes } = generateDefinitions(luaFilePath);
+
+    const luaFilePathRelative = path.relative(path.join(baseDir, "shared"), luaFilePath);
+
+    defs.forEach(def => {
+      definitionLocations.set(def.name, luaFilePath);
+    });
+    if (!locationDefinitions.has(luaFilePath)) {
+      locationDefinitions.set(luaFilePath, new Map<string, DefinitionEntry>());
+    }
+    locationDefinitions.set(luaFilePath, defs);
+    locationUsedTypes.set(luaFilePath, usedTypes);
+  } catch (e) {
+    console.error(`Error processing file ${file}`);
+    throw e;
+  } finally {
+    console.timeEnd(`🔵 Processing ${file}`);
+  }
+});
+console.timeEnd("⭕ Processing Lua files");
+
 luaFiles.forEach((file) => {
   const luaFilePath = path.join(sharedDir, file);
-  parseLuaToTypeScript(luaFilePath, outputDir, typeMap);
+  console.time(`🔵 Generating ${file}`);
+  const defs = locationDefinitions.get(luaFilePath);
+  if (defs) {
+    const usedTypes = locationUsedTypes.get(luaFilePath);
+    parseLuaFile(luaFilePath, defs, usedTypes ?? new Set(), definitionLocations);
+  }
+  console.timeEnd(`🔵 Generating ${file}`);
+
 });
 
+// Generate index.d.ts that imports and exports all the types
+const indexFilePath = path.join(outputDir, "index.d.ts");
+const indexContent = luaFiles.map(file => {
+  const relativePath = file.replace(/\.lua$/, ".d.ts").replaceAll("\\", "/");
+  return `/// <reference path="./${relativePath}" />`
+}).join("\n");
+
+fs.writeFileSync(indexFilePath, indexContent, "utf-8");
+console.log(`🟢 ${indexFilePath}`);
+
 console.log('👍 Done')
+
+
