@@ -11,6 +11,27 @@
             "type": "node",
             "program": "${workspaceFolder}/generate_typings.ts",
             "cwd": "${workspaceFolder}",
+            "args": [
+                "**/Types.lua"
+            ],
+            "env": {},
+            "runtimeExecutable": "C:\\Users\\kelpy\\.deno\\bin\\deno.EXE",
+            "runtimeArgs": [
+                "run",
+                "--inspect-wait",
+                "--allow-all"
+            ],
+            "attachSimplePort": 9229
+        },
+        {
+            "request": "launch",
+            "name": "Launch transpiler",
+            "type": "node",
+            "program": "${workspaceFolder}/lib/transpiler.ts",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "**/Types.lua"
+            ],
             "env": {},
             "runtimeExecutable": "C:\\Users\\kelpy\\.deno\\bin\\deno.EXE",
             "runtimeArgs": [

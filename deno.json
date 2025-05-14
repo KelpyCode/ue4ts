@@ -1,9 +1,12 @@
 {
   "tasks": {
-    "dev": "deno run --watch main.ts"
+    "dev": "deno run --watch main.ts",
+    "generate-types": "deno run --allow-all generate_typings.ts"
   },
   "imports": {
-    "@std/assert": "jsr:@std/assert@1"
+    "@std/assert": "jsr:@std/assert@1",
+    "@types/luaparse": "npm:@types/luaparse@^0.2.12",
+    "luaparse": "npm:luaparse@^0.3.1"
   },
   "compilerOptions": {
   },

@@ -11,6 +11,36 @@ const HARD_MAP = {
   "UFunctionParams": "any[]"
 } as Record<string, string>
 
+const REPLACERS = {
+  "TArray": def => {
+    delete def.extends
+    def.fields?.push({ name: "[index: number]", types: ["T"] });
+
+    return def
+  },
+  "TSet": def => {
+    delete def.extends
+    def.fields?.push({ name: "[index: any]", types: ["null"] });
+
+    return def
+  }
+} as Record<string, (def: DefinitionEntry) => DefinitionEntry>
+
+const INTERNAL_TYPES = [
+  "string",
+  "number",
+  "boolean",
+  "any",
+  "void",
+  "null",
+  "undefined",
+  "object",
+  "Record",
+  "fun",
+  "self",
+  "() => void",
+] 
+
 interface FieldEntry {
   name: string;
   types: string[];
@@ -68,10 +98,126 @@ function getMappedType(type: string): string {
   return type
 }
 
+function getUsedTypes(type: string): string[] {
+  // Extract all types from the string
+  // Something<T, U, V> -> [Something, T, U, V]
+  // A|B|C -> [A, B, C]
+  // Something[] -> [Something]
+  // Something<T, U, V>[] -> [Something, T, U, V]
+  // fun(test: string, test2: number): Something -> [test, test2, Something]
+  // fun(test: string, test2: number): Something[] -> [test, test2, Something]
+  // fun(test: string, test2: number) -> [test, test2]
+  
+  const arrayRegex = /^(.*)\[\]$/;
+  const genericRegex = /(\w+)<([^>]+)>/g;
+  const unionRegex = /(\w+)/g;
+  const funRegex = /^(fun\((.*?)\)|(\w+)<([^>]+)>|(\w+)\[\]|(\w+)(?:\s*\|\s*(\w+))*)/;
+  const funMatch = funRegex.exec(type);
+  const usedTypes: Set<string> = new Set();
+
+  let found = false
+
+  if (funMatch) {
+    found = true;
+    if (funMatch[1]) {
+      // Function type
+      const args = funMatch[2]?.split(",").map(arg => arg.trim().split(":").map(a => a.trim())) || [];
+      args.forEach(arg => getUsedTypes(arg[1]) .forEach(x => usedTypes.add(x)));
+    } else if (funMatch[3]) {
+      // Generic type
+      usedTypes.add(funMatch[3]);
+      funMatch[4]?.split(",").forEach(g => usedTypes.add(g.trim()));
+    } else if (funMatch[5]) {
+      // Array type
+      usedTypes.add(funMatch[5]);
+    } else if (funMatch[6]) {
+      // Union type
+      type.split("|").map(t => t.trim()).forEach(t => usedTypes.add(t));
+    }
+  }
+
+
+  if(!found) {
+    if (arrayRegex.test(type)) {
+      const match = arrayRegex.exec(type);
+      if (match) {
+        found = true
+        usedTypes.add(match[1]);
+      }
+    }
+  }
+
+  if(!found) {
+    type.replace(genericRegex, (match: string, p1: string, p2: string) => {
+    found = true
+    usedTypes.add(p1);
+    p2.split(",").forEach(g => usedTypes.add(g.trim()));
+    return match;
+  });
+  }
+
+  if (!found) {
+    type.replace(unionRegex, (match: string) => {
+      found = true
+      usedTypes.add(match);
+      return match;
+    });
+  }
+
+  return Array.from(usedTypes);
+}
+
 function getMappedTypes(types: string): string[] {
   return types.split("|").map(t => getMappedType(t))
 }
 
+class Timer {
+  private start: number;
+  private end: number;
+
+  getIndent() {
+    return Array(this.indent).fill("  ").join("");
+  }
+
+  constructor(public name: string, public indent = 0) {
+    this.start = Date.now();
+    this.end = 0;
+    console.log(`${this.getIndent()}🔵 ${this.name}`);
+  }
+
+  stop() {
+    this.end = Date.now();
+    const ms = this.end - this.start;
+    const seconds = Math.floor(ms / 1000);
+
+    console.log(`${this.getIndent()}🟢 ${this.name}: ${seconds < 2 ? ms + 'ms' : seconds + 's'}`);
+  }
+}
+
+function runReplacer(def: DefinitionEntry): DefinitionEntry {
+  for (const key in REPLACERS) {
+    if (removeGenerics(def.name) === key) {
+      const replacer = REPLACERS[key];
+      def = replacer(def);
+    }
+  }
+  return def;
+}
+
+function removeGenerics(type: string): string {
+  if (!type) return type
+  const idx = type.indexOf("<");
+  if (idx !== -1) {
+    return type.substring(0, idx);
+  }
+  return type;
+}
+
+function setDefinition(definitions: Map<string, DefinitionEntry>, def: Partial<DefinitionEntry>): void {
+  if (def.name) {
+    definitions.set(def.name, runReplacer(def as DefinitionEntry));
+  }
+}
 
 function generateDefinitions(luaFilePath: string) {
   const definitions = new Map<string, DefinitionEntry>();
@@ -93,11 +239,11 @@ function generateDefinitions(luaFilePath: string) {
       const name = parts[1];
       const third = parts[2];
       const fourth = parts[3];
-
+      const thirdRest = parts.slice(2).join(" ").trim();
 
       if (def === "@class") {
         if (currentDefinition.type) {
-          definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+          setDefinition(definitions, currentDefinition);
           currentDefinition = generateDefault();
         }
 
@@ -108,17 +254,17 @@ function generateDefinitions(luaFilePath: string) {
           currentDefinition.generics = match[2] ? match[2].split(",").map(g => g.trim()) : [];
         }
         currentDefinition.type = "class"
-        currentDefinition.name = name
+        currentDefinition.name = removeGenerics(name)
 
         if (third === ":") {
           let rest = line.substring(line.indexOf(":") + 1).trim();
           currentDefinition.extends = rest;
-          usedTypes.add(rest);
+          getUsedTypes(rest).forEach(type => usedTypes.add(getMappedType(type)));
         }
 
       } else if (def === "@enum") {
         if (currentDefinition.type && currentDefinition.name) {
-          definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+          setDefinition(definitions, currentDefinition);
           currentDefinition = generateDefault();
         }
 
@@ -126,26 +272,49 @@ function generateDefinitions(luaFilePath: string) {
         currentDefinition.name = name;
       } else if (def === "@field") {
         const comment = parts.slice(3).join(" ")
-        currentDefinition.fields!.push({ name, types: getMappedTypes(third), comment });
-        usedTypes.add(getMappedType(third));
+        const typeData = readType(thirdRest);
+        typeData.usedTypes.forEach(type => usedTypes.add(getMappedType(type)));
+        currentDefinition.fields!.push({ name, types: [typeData.type], comment });
+
+        const genericRegex = /(\w+)<(.+)>/;
+        const genericMatch = genericRegex.exec(thirdRest);
+
+        if (genericMatch) {
+          const baseType = genericMatch[1];
+          const genericTypes = genericMatch[2].split(",").map(t => t.trim());
+
+          genericTypes.forEach(type => usedTypes.add(getMappedType(type)));
+          
+          usedTypes.add(removeGenerics(baseType));
+          genericTypes.forEach(type => usedTypes.add(getMappedType(type)));
+        } else {
+          const typeData = readType(thirdRest);
+          typeData.usedTypes.forEach(type => usedTypes.add(getMappedType(type)));
+        }
       } else if (def === "@param") {
         const rest = line.substring(`---@param ${name} `.length).trim();
-        const regex = /--- *@param (?:(\w+) *(fun\((?:.*?)\)|(?:\(?(?:\w+ *\| *)*(?: *\w+)\)?\??)))( *.*$)/gm
+        const regex = /--- *@param (?:(\w+) *(fun\((?:.*?)\)|(?:\(?(?:\w+ *\| *)*(?: *\w+)\)?\??))(?::\s*([A-Za-z?|<>]+))?)( *.*$)/gm
         const match = regex.exec(line);
 
-        if (name === "...") {
-          currentDefinition.fields!.push({ name: "...args", types: [getMappedType(third)] });
-          usedTypes.add(getMappedType(third));
+        if (name === "self") {
+          currentDefinition.fields!.push({ name: "this", types: ['void'] });
+          getUsedTypes(third).forEach(type => usedTypes.add(getMappedType(type)));
+        } else if (name === "...") {
+          currentDefinition.fields!.push({ name: "...args", types: [getMappedType(removeGenerics(third))] });
+          getUsedTypes(third).forEach(type => usedTypes.add(getMappedType(type)));
         } else {
           if (match) {
             const fnDef = match[2].startsWith("fun(")
-            const types = !fnDef ? getMappedTypes(match[2]) : [getMappedType(match[2])];
-            currentDefinition.fields!.push({ name, types, comment: match[3]?.trim() ?? '' });
-            usedTypes.add(getMappedType(match[2]));
+            const types = !fnDef ? getMappedTypes(match[2]) : [getMappedType(match[2]) + (match[3] ?? '')];
+            
+            currentDefinition.fields!.push({ name, types, comment: match[4]?.trim() ?? '' });
+            
+            getUsedTypes(match[2]).forEach(type => usedTypes.add(getMappedType(type)));
+
           } else {
             currentDefinition.fields!.push({ name, types: [getMappedType(third)] });
           }
-          usedTypes.add(getMappedType(third));
+          getUsedTypes(third).forEach(type => usedTypes.add(getMappedType(type)));
         }
       } else if (def === "|") {
         // ---| `PropertyTypes.ObjectProperty`
@@ -156,13 +325,14 @@ function generateDefinitions(luaFilePath: string) {
 
         if (third) {
           currentDefinition.aliases?.push(getMappedType(third));
-          usedTypes.add(getMappedType(third));
-          definitions.set(name, currentDefinition as DefinitionEntry);
+          getUsedTypes(third).forEach(type => usedTypes.add(getMappedType(type)));
+
+          setDefinition(definitions, currentDefinition);
           currentDefinition = generateDefault();
         }
 
       } else if (def === "@return") {
-        let line2 = line.substring("---@return".length)
+        let line2 = line.substring("---@return".length).trim()
         // Remove  everything after # (comment)
         const index = line2.indexOf("#");
         if (index !== -1) {
@@ -172,7 +342,7 @@ function generateDefinitions(luaFilePath: string) {
 
 
         const l = line2.split(", ")
-        l.forEach(t => usedTypes.add(getMappedType(t)))
+        l.forEach(t => getUsedTypes(t).forEach(type => usedTypes.add(getMappedType(type))))
         if (l.length > 1) {
           currentDefinition.returnType = "[" + l.map(t => getMappedType(t.trim())).join(", ") + "]";
         } else
@@ -192,11 +362,8 @@ function generateDefinitions(luaFilePath: string) {
 
       if (insideFn && line.startsWith("end")) {
         insideFn = false;
-        if (currentDefinition.name) {
-          currentDefinition.type = "function";
-          definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
-          currentDefinition = generateDefault();
-        }
+        setDefinition(definitions, currentDefinition);
+        currentDefinition = generateDefault();
         continue
       } else if (insideFn) {
         continue
@@ -206,10 +373,8 @@ function generateDefinitions(luaFilePath: string) {
       // Finish type definition
       if (insideType && line.trim() === "}") {
         insideType = false;
-        if (currentDefinition.name) {
-          definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
-          currentDefinition = generateDefault();
-        }
+        setDefinition(definitions, currentDefinition);
+        currentDefinition = generateDefault();
         continue
       }
 
@@ -231,9 +396,9 @@ function generateDefinitions(luaFilePath: string) {
         insideType = !autoCloses
         currentDefinition.name = match[1];
         if (autoCloses) {
-          if(!currentDefinition.type)
+          if (!currentDefinition.type)
             currentDefinition.type = "class";
-          definitions.set(currentDefinition.name, currentDefinition as DefinitionEntry);
+          setDefinition(definitions, currentDefinition);
           currentDefinition = generateDefault();
         }
         continue
@@ -331,9 +496,9 @@ function handleDuplicateFns(definitions: Map<string, DefinitionEntry>, currentDe
       });
     }
     currentDefinition.fields = newTypes;
-    definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+    setDefinition(definitions, currentDefinition);
   } else {
-    definitions.set(currentDefinition.name!, currentDefinition as DefinitionEntry);
+    setDefinition(definitions, currentDefinition);
   }
 }
 
@@ -358,10 +523,10 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
       const regex = /<([\w\s,]+?)>/gm;
       const match = regex.exec(def.extends ?? "");
       if (match) {
-        result += `<${match[1]}>`;
+        result += `<${match[1].split(",").map(g => g + " = any").join(", ")}>`;
       }
     } else if (!def.name.includes("<")) {
-      result += `<${def.generics!.join(", ")}>`;
+      result += `<${def.generics!.map(g => g + " = any").join(", ")}>`;
     }
 
     if (def.extends) {
@@ -381,7 +546,11 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
     const funcs = all.values().filter(def2 => def2.type === "function" && def2.name.startsWith(def.name + ":"))
 
     for (const func of funcs) {
-      const realName = func.name.split(":")[1]
+      let realName = func.name.split(":")[1]
+
+      if (realName.includes(" ")) {
+        realName = `['${realName}']`
+      }
 
       result += renderComments(func.comments ?? [])
       result += `  ${func.static ? 'static ' : ''}${realName}(${func.fields!.map(f => `${f.name}: ${f.types.join(" | ")}`).join(", ")}): ${func.returnType ?? 'void'};\n`
@@ -416,13 +585,14 @@ function definitionToTypeScript(def: DefinitionEntry, all: Map<string, Definitio
   return result;
 }
 
+const MODULE = false
 
 function parseLuaFile(luaFilePath: string, definitions: Map<string, DefinitionEntry>, usedType: Set<string>, definitionLocations: Map<string, string>) {
   // let result = "declare global {\n";
   let result = ""
 
   // Generate imports
-  const types = [...usedType];
+  const types = [...usedType].filter(type => !INTERNAL_TYPES.includes(type));
   const importsMap = new Map<string, Set<string>>();
 
   types.forEach(type => {
@@ -436,29 +606,59 @@ function parseLuaFile(luaFilePath: string, definitions: Map<string, DefinitionEn
     }
   });
 
+  const unusedTypes = new Set<string>();
+
   const imports = Array.from(importsMap.entries()).map(([relativePath, types]) => {
-    // return `import type { ${Array.from(types).join(", ")} } from "./${relativePath.replaceAll("\\","/")}.d.ts";`;
-    return `/// <reference path="./${relativePath.replaceAll("\\", "/")}.d.ts" />`;
+    return `import type { ${Array.from(types).join(", ")} } from "./${relativePath.replaceAll("\\", "/")}.d.ts";`;
+    // return `/// <reference path="./${relativePath.replaceAll("\\", "/")}.d.ts" />`;
   });
 
-  result += imports.join("\n") + "\n\n";
+  const invalidTypes = types.filter(type => !definitionLocations.has(type));
 
-  result += "export {};\ndeclare global {\n";
+    invalidTypes.forEach(type => unusedTypes.add(type));
+
+  //   return `import type { ${validTypes.join(", ")} } from "./${relativePath.replaceAll("\\", "/")}.d.ts";`;
+  // });
+
+  
+  result += imports.join("\n") + "\n\n";
+  
+  if (unusedTypes.size > 0) {
+    console.warn("⚠️ Unused types detected:");
+    console.warn(Array.from(unusedTypes).join(", "));
+
+    // Generate any type definitions for those files
+    unusedTypes.forEach(type => {
+      result += `declare type ${type} = any; // Not found in definitions\n`;
+    });
+  }
+  if (MODULE)
+    result += "export {};\ndeclare global {\n";
 
   definitions.forEach(def => {
     result += definitionToTypeScript(def, definitions)
   })
 
-  result += "}\n"
+  if (MODULE)
+    result += "}\n"
   // result += "}\n\nexport {};\n";
   // Write the result to a .d.ts file
   const relativePath = path.relative(path.join(import.meta.dirname!, "shared"), luaFilePath);
   const outputFilePath = path.join("tstypes", relativePath.replace(/\.lua$/, ".d.ts"));
+  if (fs.existsSync(outputFilePath)) {
+    const existingContent = fs.readFileSync(outputFilePath, "utf-8");
+    if (existingContent === result) {
+      console.log(`🟡 Skipping ${outputFilePath} (no changes)`);
+      return;
+    }
+  }
   fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
   fs.writeFileSync(outputFilePath, result, "utf-8");
-  console.log(`🟢 ${outputFilePath}`);
+  // console.log(`🟢 ${outputFilePath}`);
 }
 
+
+/**  ----------------------------------------------------------------- */
 // Define paths
 const sharedDir = path.join(import.meta.dirname!, "shared");
 const outputDir = path.join(import.meta.dirname!, "tstypes");
@@ -468,24 +668,27 @@ const outputDir = path.join(import.meta.dirname!, "tstypes");
 
 // Process each Lua file
 // const luaFiles = glob("**/*.lua", { cwd: sharedDir });
-const luaFiles = glob("**/*.lua", { cwd: sharedDir });
+const luaFiles = glob(process.argv[2] || "**/*.lua", { cwd: sharedDir });
 const definitionLocations = new Map<string, string>();
 const locationDefinitions = new Map<string, Map<string, DefinitionEntry>>();
 const locationUsedTypes = new Map<string, Set<string>>();
 
-console.time("⭕ Processing Lua files");
+const transpilationTimer = new Timer("Transpiling types");
+const processTimer = new Timer(`Process ${luaFiles.length} Lua files`, 1);
 luaFiles.forEach((file) => {
+  const baseDir = import.meta.dirname!;
+  const luaFilePath = path.join(sharedDir, file);
+  const luaFileTimer = new Timer(`Processing ${file}`, 2);
   try {
-    const baseDir = import.meta.dirname!;
-    const luaFilePath = path.join(sharedDir, file);
-
-    console.time(`🔵 Processing ${file}`);
 
     const { definitions: defs, usedTypes } = generateDefinitions(luaFilePath);
 
     const luaFilePathRelative = path.relative(path.join(baseDir, "shared"), luaFilePath);
 
     defs.forEach(def => {
+      if (!luaFilePath.endsWith("Type.lua") && definitionLocations.has(def.name)) {
+        return; // Skip overwriting if the file is "Type.lua" and a definition already exists
+      }
       definitionLocations.set(def.name, luaFilePath);
     });
     if (!locationDefinitions.has(luaFilePath)) {
@@ -497,33 +700,62 @@ luaFiles.forEach((file) => {
     console.error(`Error processing file ${file}`);
     throw e;
   } finally {
-    console.timeEnd(`🔵 Processing ${file}`);
+    luaFileTimer.stop();
   }
 });
-console.timeEnd("⭕ Processing Lua files");
-
+processTimer.stop();
+const generationTimer = new Timer(`Generating ${luaFiles.length} TypeScript files`, 1);
 luaFiles.forEach((file) => {
   const luaFilePath = path.join(sharedDir, file);
-  console.time(`🔵 Generating ${file}`);
+  const luaFileTimer = new Timer(`Generating ${file}`, 2);
   const defs = locationDefinitions.get(luaFilePath);
   if (defs) {
     const usedTypes = locationUsedTypes.get(luaFilePath);
     parseLuaFile(luaFilePath, defs, usedTypes ?? new Set(), definitionLocations);
   }
-  console.timeEnd(`🔵 Generating ${file}`);
+  luaFileTimer.stop();
 
 });
+generationTimer.stop();
 
 // Generate index.d.ts that imports and exports all the types
 const indexFilePath = path.join(outputDir, "index.d.ts");
 const indexContent = luaFiles.map(file => {
   const relativePath = file.replace(/\.lua$/, ".d.ts").replaceAll("\\", "/");
-  return `/// <reference path="./${relativePath}" />`
+  // return `/// <reference path="./${relativePath}" />`
+  return `export type * from "./${relativePath}"`
 }).join("\n");
 
 fs.writeFileSync(indexFilePath, indexContent, "utf-8");
+
+fs.writeFileSync("./debug.definitionLocations.json", Array.from(definitionLocations.entries()).filter(x => !x[0].includes(":")).map(x => x[0] + " : " + path.relative(sharedDir,x[1])).join("\n"), "utf-8");
+
+transpilationTimer.stop()
 console.log(`🟢 ${indexFilePath}`);
 
 console.log('👍 Done')
 
 
+
+function readType(str: string): { type: string, usedTypes: string[], comment: string } {
+  // Read fun, generic, array, union types.
+  // fun: fun(test: string, test2: number) Some comment
+  // generic: Something<T, U> Some comment
+  // array: Something[] Some comment
+  // union: Something | Something2 Some comment
+  // type: Full type string without comment
+  // usedTypes: Array of types used in the type string
+  // comment: Comment string
+
+
+  const regex = /^(fun\((.*?)\)|(\w+)<([^>]+)>|(\w+)\[\]|(\w+)(?:\s*\|\s*(\w+))*)/gm;
+  const match = regex.exec(str);
+  if (match) {
+    const type = match[0];
+    const usedTypes = getUsedTypes(type);
+    const comment = str.substring(type.length).trim();
+    return { type, usedTypes, comment };
+  }
+  return { type: str, usedTypes: [], comment: "" };
+
+}
