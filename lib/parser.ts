@@ -1,7 +1,6 @@
 /*
  * A TypeScript parser for Lua annotations as per https://github.com/LuaLS/lua-language-server/wiki/Annotations
  * Supports @param, @return, @class, @alias, @field, @enum, @meta, including generics, unions, function types, table types, array types, and comments.
- * Each AST node now records its 1-based source line number.
  */
 
 // AST node definitions

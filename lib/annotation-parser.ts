@@ -15,13 +15,15 @@ export interface MetaNode { kind: 'meta'; line: number; }
 export interface CommentNode { kind: 'comment'; text: string; line: number; }
 
 // Type AST nodes
-export type TypeNode = SimpleTypeNode | GenericTypeNode | UnionTypeNode | FunctionTypeNode | TableTypeNode | ArrayTypeNode;
+export type TypeNode = SimpleTypeNode | GenericTypeNode | UnionTypeNode | FunctionTypeNode | TableTypeNode | ArrayTypeNode | StaticArrayTypeNode | OptionalTypeNode;
 export interface SimpleTypeNode { kind: 'simple'; name: string; }
+export interface OptionalTypeNode { kind: 'optional'; type: TypeNode; }
 export interface GenericTypeNode { kind: 'generic'; base: string; parameters: TypeNode[]; }
 export interface UnionTypeNode { kind: 'union'; options: TypeNode[]; }
 export interface FunctionTypeNode { kind: 'function'; parameters: { name?: string; type: TypeNode }[]; returnType: TypeNode; }
 export interface TableTypeNode { kind: 'table'; fields: { key: TypeNode; value: TypeNode }[]; }
 export interface ArrayTypeNode { kind: 'array'; elementType: TypeNode; }
+export interface StaticArrayTypeNode { kind: 'staticArray'; elementType: TypeNode[]; }
 
 // Main parser entrypoint
 let currentLine = 0
@@ -57,7 +59,7 @@ export function parseAnnotations(lines: string[]): ASTNode[] {
                 const variants: string[] = [];
                 let j = i + 1;
                 while (j < lines.length && lines[j].trim().startsWith('---|')) {
-                    const lineVariant = lines[j].trim().slice(4).trim().replace(/`/g, '');
+                    const lineVariant = lines[j].trim().slice(4).trim();
                     variants.push(lineVariant);
                     j++;
                 }
@@ -114,9 +116,15 @@ function extractTypeAndDesc(str: string): [string, string] {
         const c = str[i];
         if ('<{('.includes(c)) depth++;
         else if ('>})'.includes(c)) depth--;
-        else if (c === ' ' && depth === 0) break;
+        // If at top level and see a space after a comma-separated type list, break
+        else if (c === ' ' && depth === 0) {
+            // Only break if the previous character is not a comma (to allow comma-separated types)
+            let prev = i - 1;
+            while (prev >= 0 && str[prev] === ' ') prev--;
+            if (prev < 0 || str[prev] !== ',') break;
+        }
     }
-    return [str.slice(0, i), str.slice(i).trim()];
+    return [str.slice(0, i).trim(), str.slice(i).trim()];
 }
 
 function splitTopLevel(input: string, sep: string): string[] {
@@ -166,7 +174,20 @@ function parseType(input: string): TypeNode {
 }
 
 function parseSingle(typeStr: string): TypeNode {
-    const str = typeStr?.trim();
+    let str = typeStr?.trim();
+    if (str && str.endsWith('?')) {
+        return { kind: 'optional', type: parseType(str.slice(0, -1).trim()) };
+    }
+    // Support for tuple types like "integer, integer, integer"
+    if (str && str.includes(',') && !str.startsWith('{') && !str.startsWith('fun') && !str.endsWith('[]')) {
+        const tupleTypes = splitTopLevel(str, ',');
+        if (tupleTypes.length > 1) {
+            return {
+                kind: 'staticArray',
+                elementType: tupleTypes.map(t => parseType(t))
+            };
+        }
+    }
     if (!str) throw new Error(`[${currentLine}: ${currentLineText}] Empty type`);
     if (str.endsWith('[]')) {
         const inner = str.slice(0, -2).trim();
@@ -195,8 +216,16 @@ function parseFunctionType(str: string): FunctionTypeNode {
     }
     const paramsRaw = header.slice(header.indexOf('(') + 1, header.lastIndexOf(')'));
     const params = splitTopLevel(paramsRaw, ',').filter(Boolean).map(p => {
-        const qm = /^([\w$]+)\s*:\s*(.+)$/.exec(p.trim());
-        return qm ? { name: qm[1], type: parseType(qm[2]) } : { type: parseType(p.trim()) };
+        const trimmed = p.trim();
+        const qm = /^([\w$]+)\s*:\s*(.+)$/.exec(trimmed);
+        if (qm) {
+            return { name: qm[1], type: parseType(qm[2]) };
+        } else if (trimmed === '...') {
+            return { name: '...', type: parseType('any') };
+        } else if (trimmed) {
+            return { name: trimmed, type: parseType('any') };
+        }
+        return { type: parseType('any') };
     });
     const returnType: TypeNode = retRaw ? parseType(retRaw) : { kind: 'simple', name: 'void' };
     return { kind: 'function', parameters: params, returnType };

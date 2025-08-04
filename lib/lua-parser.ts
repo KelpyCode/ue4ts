@@ -1,78 +1,78 @@
 import * as Lua from "npm:luaparse"
 import * as Annotation from "./annotation-parser.ts"
 
-export function parse(source: string): { parsedCommentMap: Map<Lua.Statement, Annotation.ASTNode[]>; commentBlocks: Set<Annotation.ASTNode[]> } {
-    const commentMap = new Map<Lua.Statement, Lua.Comment[]>()
+export function parse(source: string) {
     const parsedCommentMap = new Map<Lua.Statement, Annotation.ASTNode[]>()
     const commentBlocks = new Set<Annotation.ASTNode[]>();
+    const commentGroupRange = new Map<Annotation.ASTNode[], { from: number, to: number }>();
+    const statementComments = new Set<Annotation.ASTNode[]>();
 
-    const ast = Lua.parse(source, {comments: true, ranges: true, locations: true, scope: true, luaVersion: "5.3"})
+    const ast = Lua.parse(source, { comments: true, ranges: true, locations: true, scope: true, luaVersion: "5.3" })
+
+    // First off, group all comments into blocks
+    // This is done by checking if the comments are adjacent to each other
+    if (ast.comments) {
+        const handledComments = new Set<Lua.Comment>();
+        let currentBlock: Lua.Comment[] = [];
+        let fromLine = -1;
+        let toLine = -1;
+
+        for (const comment of ast.comments as unknown as Lua.Comment[]) {
+            if (handledComments.has(comment)) continue;
+
+            const line = comment.loc!.start.line;
+
+            if (currentBlock.length === 0 || line === toLine + 1) {
+                if (currentBlock.length === 0) fromLine = line;
+                toLine = line;
+                currentBlock.push(comment);
+                handledComments.add(comment);
+            } else {
+                if (currentBlock.length > 0) {
+                    const astNodes = Annotation.parseAnnotations(currentBlock.map(c => c.raw));
+                    commentBlocks.add(astNodes);
+                    commentGroupRange.set(astNodes, { from: fromLine, to: toLine });
+                }
+                currentBlock = [comment];
+                fromLine = line;
+                toLine = line;
+                handledComments.add(comment);
+            }
+        }
+
+        // Handle the last block
+        if (currentBlock.length > 0) {
+            const astNodes = Annotation.parseAnnotations(currentBlock.map(c => c.raw));
+            commentBlocks.add(astNodes);
+            commentGroupRange.set(astNodes, { from: fromLine, to: toLine });
+        }
+    }
+
+
     for (const node of ast.body) {
         // Find comments right above the node
         const line = node.loc!.start.line;
 
-        const comments: Lua.Comment[] = [];
-        let lastSafeLine = -1;
-            
-        // Get all comments that are above the node. If there is a line missing between, ignore all above
-        (ast.comments as unknown as Lua.Comment[]).reverse()?.forEach((comment) => {
-            const commentLine = comment.loc!.start.line;
-            if (line - 1 === commentLine || commentLine === lastSafeLine - 1) {
-                comments.push(comment);
-                lastSafeLine = commentLine
-            } else {
-                lastSafeLine = -1
-            }
+        // Find comment block that is right above the node
+        const commentBlock = Array.from(commentBlocks).find(block => {
+            const range = commentGroupRange.get(block);
+            if (!range) return false;
+            return range.to === line - 1 || (range.from === range.to && range.to === line - 1);
+        });
 
-        })
-
-        commentMap.set(node, comments.reverse())
-
-        const astComments = Annotation.parseAnnotations(comments.reverse().map((comment) => comment.raw))
-        parsedCommentMap.set(node, astComments)
-        // console.log(node);
-    }
-    // Collect all comments and map by line
-    const allComments = ast.comments as unknown as Lua.Comment[];
-    const commentByLine = new Map<number, Lua.Comment>();
-    allComments.forEach(c => commentByLine.set(c.loc!.start.line, c));
-    // Mark assigned comments: for each statement, walk contiguous comments immediately above it (tags or pure)
-    const assignedComments = new Set<Lua.Comment>();
-    for (const node of commentMap.keys()) {
-        let line = (node.loc!.start.line || 0) - 1;
-        while (true) {
-            const c = commentByLine.get(line);
-            if (!c) break;
-            assignedComments.add(c);
-            line--;
-        }
-    }
-    // Orphan pure comments: pure '---' lines not assigned and not annotation tags
-    const unassigned = allComments.filter(c => {
-        const raw = c.raw.trim();
-        return raw.startsWith('---') && !raw.startsWith('---@') && !assignedComments.has(c);
-    });
-    // Group contiguous unassigned comments into blocks
-    const sorted = unassigned.slice().sort((a, b) => a.loc!.start.line - b.loc!.start.line);
-    let block: Lua.Comment[] = [];
-    let prevLine = -Infinity;
-    const flush = (b: Lua.Comment[]) => {
-        if (b.length === 0) return;
-        const astNodes = Annotation.parseAnnotations(b.map(cm => cm.raw));
-        commentBlocks.add(astNodes);
-    };
-    for (const c of sorted) {
-        const ln = c.loc!.start.line;
-        if (ln === prevLine + 1) {
-            block.push(c);
+        if (commentBlock) {
+            parsedCommentMap.set(node, commentBlock);
+            statementComments.add(commentBlock);
         } else {
-            flush(block);
-            block = [c];
+            parsedCommentMap.set(node, []);
         }
-        prevLine = ln;
+
+        // Find comment blocks unrelated to statements
+
     }
-    flush(block);
-    return { parsedCommentMap, commentBlocks };
+    const standaloneComments = Array.from(commentBlocks).filter(block => !statementComments.has(block)).filter(x => x.length > 0)
+
+    return { parsedCommentMap, commentBlocks, standaloneComments };
 
 }
 
@@ -91,7 +91,7 @@ export function traverse(node: Lua.Node, callback: (node: Lua.Node) => void) {
         } else if (typeof child === "object" && child !== null) {
             traverse(child as Lua.Node, callback);
         }
-    
+
     }
 }
 
