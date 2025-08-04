@@ -31,7 +31,7 @@ export class MetaHandler {
 
     load() {
         try {
-            const t = Deno.readTextFileSync("./output/meta.json");
+            const t = Deno.readTextFileSync("./ue4ts-meta.json");
             const md = JSON.parse(t) as MetaDataCompressed;
             const md2: MetaData = {
                 entries: md.entries.map(x => ({
@@ -64,7 +64,7 @@ export class MetaHandler {
                 fnHash: x.fnHash
             }))
         };
-        Deno.writeTextFileSync("./output/meta.json", JSON.stringify(compressed, null, 2));
+        Deno.writeTextFileSync("./ue4ts-meta.json", JSON.stringify(compressed, null, 2));
     }
 
     findExport(name: string): MetaDataEntry[] {

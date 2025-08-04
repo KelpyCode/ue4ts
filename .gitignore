@@ -3,3 +3,4 @@ tstypes/*
 types
 debug.*
 output/*
+ue4ts-meta.json

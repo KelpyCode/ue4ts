@@ -8,6 +8,10 @@ import { encodeHex } from "jsr:@std/encoding/hex";
 import packageInfo from "../deno.json" with { type: "json" };
 import { hash } from "node:crypto";
 import { MetaHandler } from "./MetaHandler.ts";
+
+const DEBUG_FORCE_REBUILD = true
+
+
 const INTERNALS = [
     "string", "number", "boolean", "function", "unknown", "any", "void", "null", "undefined"
 ]
@@ -32,7 +36,16 @@ const CLASS_NAME_REPLACER = {
     "RemoteObject": "RemoteObject<T = any>"
 } as Record<string, string>;
 
-const DEBUG_FORCE_REBUILD = true
+const CLASS_PROPERTY_REPLACER = {
+    "ABP_OblivionPlayerCharacter_C.GetClass": "GetClass(): TSubclassOf<AActor>",
+    "UObject.GetFullName": "GetFullName(...args: any): string | FString",
+    "UObject.GetClass": "GetClass(...args: any): UClass",
+    "UObject.GetPropertyValue": "GetPropertyValue<ReturnType = any>(...args: any): ReturnType",
+    "RemoteObject.IsValid": "IsValid(...args: any): boolean",
+    "ULiveLinkBlueprintLibrary.GetPropertyValue": "// GetPropertyValue - skipped because of type errors",
+    "UMaterialExpressionReflectionCapturePassSwitch.Reflection": "// Reflection - skipped because of type errors",
+} as Record<string, string>;
+
 
 async function generateHash(str: string) {
     const encoder = new TextEncoder();
@@ -617,12 +630,19 @@ export async function process(path: string[]) {
         }
 
 
-        const renderFunction = (func: TSStatement, globalFn = false, objectType = false): void => {
+        const renderFunction = (func: TSStatement, globalFn = false, objectType = false, className: string | null = null): void => {
             if (func.type !== "FunctionStatement") return;
             const isStatic = !globalFn && func.name.includes(".");
             const name = globalFn ? func.name : isStatic ? func.name.split(".")[1] : func.name.split(":")[1];
 
+
             renderComments(func.comments || []);
+            const replacerIndex = (className ?? '') + "." + name
+            console.log("Check replacer FN", replacerIndex)
+            if (CLASS_PROPERTY_REPLACER[replacerIndex]) {
+                render += `    ${CLASS_PROPERTY_REPLACER[replacerIndex]};\n`;
+                return
+            }
             const params = Array.from(func.params.entries()).map(([k, v]) => `${k}: ${v.type}`);
 
             if (isStatic) {
@@ -713,9 +733,18 @@ export async function process(path: string[]) {
 
             // Functions
             statements.filter(x => x.type === "FunctionStatement" && (x.name.startsWith(cls.name + ":") || x.name.startsWith(cls.name + ".")))
-                .forEach(x => renderFunction(x, false))
+                .forEach(x => renderFunction(x, false, false, cls.name))
+
 
             cls.fields.forEach(field => {
+
+                const replacerIndex = (cls.name ?? '') + "." + field.name
+                console.log("Check replacer FN", replacerIndex)
+                if (CLASS_PROPERTY_REPLACER[replacerIndex]) {
+                    render += `    ${CLASS_PROPERTY_REPLACER[replacerIndex]};\n`;
+                    return
+                }
+
                 render += `    ${field.name}: ${field.type};\n`
             })
             render += `}\n\n`
@@ -770,7 +799,7 @@ export async function process(path: string[]) {
         // If there are not found types, declare them with unknown
         if (result.notFound!.size > 0) {
             result.render += "// Unresolved dependencies\n";
-            [...result.notFound].forEach(type => {
+            [...result.notFound!].forEach(type => {
                 if (FALLBACK_DEFS[type]) {
                     result.render += `${FALLBACK_DEFS[type]}\n`;
                 } else {
@@ -788,10 +817,10 @@ export async function process(path: string[]) {
     });
     // Generate import statements
     results.forEach(result => {
-        const outputPath = "./output/" + result.path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
+        const outputPath = result.path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
         const outputDir = outputPath.substring(0, outputPath.lastIndexOf("/"));
-        const imports = Array.from(result.imports.entries()).map(([path, types]) => {
-            const importFilePath = "./output/" + path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
+        const imports = Array.from(result.imports.entries() as Iterable<[string, string[]]>).map(([path, types]) => {
+            const importFilePath = path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
             let relPath = relative(outputDir, importFilePath).replaceAll("\\", "/");
             if (!relPath.startsWith(".")) relPath = "./" + relPath;
             return `import type { ${types.join(", ")} } from "${relPath}";`;
@@ -801,7 +830,7 @@ export async function process(path: string[]) {
 
     // Write each result to a file
     results.forEach(result => {
-        const outputPath = "./output/" + result.path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
+        const outputPath = result.path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
         // Ensure the output directory exists
         const outputDir = outputPath.substring(0, outputPath.lastIndexOf("/"));
         Deno.mkdirSync(outputDir, { recursive: true });
@@ -832,7 +861,8 @@ export async function process(path: string[]) {
 
 
 
-console.log(process(["./**/*.lua"]))
+console.log(process(["./**/types/*.lua", "./**/UEHelpers/*.lua"]))
+// console.log(process(["./**/types/BP_OblivionPlayerCharacter.lua"]))
 
 
 // console.log(process(["./shared/**/*.lua"]))
