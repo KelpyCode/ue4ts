@@ -24,11 +24,12 @@ const TYPE_REPLACERS = {
 }
 
 const FALLBACK_DEFS = {
-    "TWeakObjectPtr": "type TWeakObjectPtr<T = any> = unknown",
-    "TObjectPtr": "type TObjectPtr<T = any> = unknown",
-    "TFieldPath": "type TFieldPath<T = any> = unknown",
-    "TLazyObjectPtr": "type TLazyObjectPtr<T = any> = unknown",
-    "RemoteObject": ""
+    "RemoteObject": "",
+    "LocalObject": "export class LocalObject {} // Gets extended but has no Lua definition apparently, if you see this you have small pp"
+} as Record<string, string>;
+
+const CLASS_NAME_REPLACER = {
+    "RemoteObject": "RemoteObject<T = any>"
 } as Record<string, string>;
 
 const DEBUG_FORCE_REBUILD = true
@@ -516,13 +517,16 @@ function renderStatement(types: string[], node: Lua.Statement | null, comments: 
         });
     } else {
         meta.classes.forEach(cls => {
-
+            let name = cls.name;
+            if (CLASS_NAME_REPLACER[name]) {
+                name = CLASS_NAME_REPLACER[name];
+            }
             statements.push({
                 type: "ClassStatement",
-                name: cls.name,
+                name,
                 fields: meta.fields,
                 generics: cls.generics ?? [],
-                extends: cls.extends,
+                extends: cls.extends === cls.name ? undefined : cls.extends,
                 tableType: cls.tableType,
                 comments: meta.comments,
                 useType: cls.useType ?? false
@@ -692,8 +696,16 @@ export async function process(path: string[]) {
                 render += `export type ${cls.name}${cls.generics.length ? `<${cls.generics.join(", ")}>` : ""} = ${cls.extends}\n`
                 return
             }
+            let name = cls.name
+            if (CLASS_NAME_REPLACER[cls.name]) {
+                name = CLASS_NAME_REPLACER[cls.name];
+            }
 
-            render += `export class ${cls.name}${cls.generics.length ? `<${cls.generics.map(x => x + ' = unknown').join(", ")}>` : ""}${cls.extends ? ` extends ${cls.extends}` : ""} {\n`
+            if (cls.name === cls.extends) {
+                cls.extends = undefined
+            }
+
+            render += `export class ${name}${cls.generics.length ? `<${cls.generics.map(x => x + ' = unknown').join(", ")}>` : ""}${cls.extends ? ` extends ${cls.extends}` : ""} {\n`
             if (cls.tableType) {
                 render += `    ${cls.tableType}\n`
             }
@@ -761,8 +773,15 @@ export async function process(path: string[]) {
             [...result.notFound].forEach(type => {
                 if (FALLBACK_DEFS[type]) {
                     result.render += `${FALLBACK_DEFS[type]}\n`;
-                } else
-                    result.render += `type ${type} = unknown;\n`
+                } else {
+                    const hasGeneric = type.includes("<")
+                    const typeWithoutGeneric = type.split("<")[0];
+                    // Check if type exists in scope, skip if it does
+                    if (result.exportDefs?.has(typeWithoutGeneric) || INTERNALS.includes(typeWithoutGeneric))
+                        return;
+
+                    result.render += `type ${type}${!hasGeneric ? "<UNKNOWN = any>" : ""} = unknown;\n`
+                }
             })
             result.render += "// -------------\n\n"
         }
