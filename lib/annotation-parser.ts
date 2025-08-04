@@ -73,13 +73,13 @@ export function parseAnnotations(lines: string[]): ASTNode[] {
                 break;
             }
             case 'param': {
-                const [name, rem] = splitOnce(rest, ' ');
+                const [name, rem] = splitNameWithBrackets(rest);
                 const [typeRaw, desc] = extractTypeAndDesc(rem);
                 nodes.push({ kind: 'param', name, type: parseType(typeRaw), description: desc, line: lineNo });
                 break;
             }
             case 'field': {
-                const [name, rem] = splitOnce(rest, ' ');
+                const [name, rem] = splitNameWithBrackets(rest);
                 const [typeRaw, desc] = extractTypeAndDesc(rem);
                 nodes.push({ kind: 'field', name, type: parseType(typeRaw), description: desc, line: lineNo });
                 break;
@@ -107,6 +107,25 @@ function splitOnce(str: string, delim: string): [string, string] {
     const idx = str.indexOf(delim);
     if (idx < 0) return [str, ''];
     return [str.slice(0, idx), str.slice(idx + delim.length).trim()];
+}
+
+function splitNameWithBrackets(str: string): [string, string] {
+    if (!str.startsWith('[')) return splitOnce(str, ' ');
+
+    let depth = 0;
+    for (let i = 0; i < str.length; i++) {
+        const c = str[i];
+        if (c === '[') depth++;
+        else if (c === ']') depth--;
+
+        // When we've found the matching closing bracket and the next character is a space
+        if (depth === 0 && c === ']' && (i + 1 < str.length && str[i + 1] === ' ')) {
+            return [str.slice(0, i + 1), str.slice(i + 2).trim()];
+        }
+    }
+
+    // If we didn't find a proper closing bracket followed by space, fall back to regular split
+    return splitOnce(str, ' ');
 }
 
 function extractTypeAndDesc(str: string): [string, string] {

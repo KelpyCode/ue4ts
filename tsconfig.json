@@ -2,6 +2,7 @@
     "exclude": [
         "shared/*",
         "tstypes/*",
-        "debug.output.ts"
+        "debug.output.ts",
+        "output/*"
     ]
 }

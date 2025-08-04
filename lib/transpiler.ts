@@ -3,11 +3,15 @@ import * as Annotation from "./annotation-parser.ts"
 import { globSync as glob } from "npm:glob";
 import { parse } from "./lua-parser.ts"
 import { FIXERS } from './fixers.ts';
-import { relative, dirname, sep, join } from "https://deno.land/std@0.224.0/path/mod.ts";
-
+import { relative, dirname, join } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { encodeHex } from "jsr:@std/encoding/hex";
+import packageInfo from "../deno.json" with { type: "json" };
+import { hash } from "node:crypto";
+import { MetaHandler } from "./MetaHandler.ts";
 const INTERNALS = [
     "string", "number", "boolean", "function", "unknown", "any", "void", "null", "undefined"
 ]
+
 
 const TYPE_REPLACERS = {
     "integer": "number",
@@ -18,6 +22,39 @@ const TYPE_REPLACERS = {
     "lightuserdata": "Record<string, any>",
     "table": "Record<string, any>",
 }
+
+const FALLBACK_DEFS = {
+    "TWeakObjectPtr": "type TWeakObjectPtr<T = any> = unknown",
+    "TObjectPtr": "type TObjectPtr<T = any> = unknown",
+    "TFieldPath": "type TFieldPath<T = any> = unknown",
+    "TLazyObjectPtr": "type TLazyObjectPtr<T = any> = unknown",
+    "RemoteObject": ""
+} as Record<string, string>;
+
+const DEBUG_FORCE_REBUILD = true
+
+async function generateHash(str: string) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(str);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    return encodeHex(new Uint8Array(hashBuffer));
+}
+
+async function generateFnHash(path: string): Promise<string> {
+    return await generateHash(`${packageInfo.version}::${path}`);
+}
+
+async function generateFcHash(path: string, render: string): Promise<string> {
+    const x = await generateHash(`${packageInfo.version}::${path}::${render}`);
+    // console.log("Generated fc hash ", path, render.length)
+    // console.log(x)
+    return x
+
+}
+
+
+
+const metadataHandler = new MetaHandler()
 
 
 type TSType = TSTypeRefExpression | TSFunctionExpression | TSOrTypeExpression | TSConstValueExpression | TSUnaryExpression
@@ -56,12 +93,17 @@ interface TSOrTypeExpression extends TSBase {
     types: string[]
 }
 
-type TSStatement = TSFunctionStatement | TSEnumStatement | TSClassStatement | TSAliasStatement
+type TSStatement = TSFunctionStatement | TSEnumStatement | TSClassStatement | TSAliasStatement | TSDeclareObjectStatement | TSExportStatement
 
 interface TSEnumStatement extends TSBase {
     type: "EnumStatement"
     name: string
     entries: [string, string][]
+}
+
+interface TSExportStatement extends TSBase {
+    type: "ExportStatement"
+    name: string
 }
 
 interface TSFunctionStatement extends TSBase {
@@ -88,6 +130,12 @@ interface TSClassStatement extends TSBase {
     useType: boolean
 }
 
+interface TSDeclareObjectStatement extends TSBase {
+    type: "DeclareObjectStatement"
+    name: string
+}
+
+
 interface TSAliasStatement extends TSBase {
     type: "AliasStatement"
     name: string
@@ -96,6 +144,8 @@ interface TSAliasStatement extends TSBase {
 
 
 function replaceType(type: string): string {
+    type = type.replace("::Type", "")
+
     return TYPE_REPLACERS[type as keyof typeof TYPE_REPLACERS] || type;
 }
 
@@ -310,20 +360,42 @@ function renderStatement(types: string[], node: Lua.Statement | null, comments: 
     const meta = readComments(types, comments);
     if (node) {
         $route(node, {
+            "ReturnStatement": ret => {
+                ret.arguments.forEach(arg => {
+                    $route(arg, {
+                        "Identifier": id => {
+                            statements.push({
+                                type: "ExportStatement",
+                                name: id.name,
+                            })
+                        }
+                    })
+                })
+            },
             "LocalStatement": local => {
                 if (!meta.isEnum) {
                     local.init.forEach(init => {
                         $route(init, {
                             "TableConstructorExpression": table => {
                                 if (meta.classes.length) {
+                                    const _extends = meta.classes.flatMap(x => x.extends ?? [])?.[0] ?? undefined;
+                                    if (_extends) types.push(_extends)
+                                    const generics = meta.classes.flatMap(x => x.generics ?? []);
                                     statements.push({
                                         type: "ClassStatement",
                                         name: meta.classes[0].name,
-                                        generics: meta.classes.flatMap(x => x.generics ?? []),
+                                        generics,
+                                        extends: _extends,
                                         fields: meta.fields,
                                         comments: meta.comments,
                                         useType: false
                                     });
+                                } else {
+                                    const x: TSDeclareObjectStatement = {
+                                        type: "DeclareObjectStatement",
+                                        name: local.variables[0].name,
+                                    };
+                                    statements.push(x)
                                 }
                             }
                         });
@@ -390,7 +462,7 @@ function renderStatement(types: string[], node: Lua.Statement | null, comments: 
                         }
                     });
                 }
-                const returnType = meta.returnType;
+                const returnType = meta.returnType
                 statements.push({
                     type: "FunctionStatement",
                     name,
@@ -469,12 +541,14 @@ function renderStatement(types: string[], node: Lua.Statement | null, comments: 
     return statements;
 }
 
-export function process(path: string[]) {
+export async function process(path: string[]) {
+    metadataHandler.load();
+
 
     // Clear previously collected types
     const paths = new Set(path.flatMap(p => glob(p)));
     console.log("PATHS", [...paths].join(", "))
-    const results = [...paths].map(p => {
+    const resultsUnfiltered = await Promise.all([...paths].map(async p => {
         console.log("Transpiling", p)
         const statements: TSStatement[] = [];
         const types: string[] = []
@@ -483,6 +557,24 @@ export function process(path: string[]) {
         const exportDefs = new Set<string>();
 
         // Deno.writeTextFileSync("./debug.annotations.json", JSON.stringify(Annotation.parseAnnotations(sourceString.split("\n")), null, 2))
+
+        const previous = metadataHandler.findPath(p);
+        if (!DEBUG_FORCE_REBUILD && previous) {
+            const fcHash = await generateFcHash(p, sourceString);
+            if (previous.fcHash === fcHash) {
+                console.log(`Skipping ${p} as it has not changed.`);
+                return {
+                    path: p,
+                    imports: previous.imports!,
+                    missingDeps: previous.missingDeps!,
+                    exports: previous.exports!,
+                    fnHash: previous.fnHash!,
+                    fcHash: previous.fcHash!,
+                    sourceString,
+                    skip: true
+                };
+            }
+        }
 
         // Run fixer
         FIXERS.forEach(fixer => {
@@ -521,7 +613,7 @@ export function process(path: string[]) {
         }
 
 
-        const renderFunction = (func: TSStatement, globalFn = false): void => {
+        const renderFunction = (func: TSStatement, globalFn = false, objectType = false): void => {
             if (func.type !== "FunctionStatement") return;
             const isStatic = !globalFn && func.name.includes(".");
             const name = globalFn ? func.name : isStatic ? func.name.split(".")[1] : func.name.split(":")[1];
@@ -532,10 +624,15 @@ export function process(path: string[]) {
             if (isStatic) {
                 params.unshift("this: void");
             }
-            const returnType = func.returnType ? `: ${func.returnType}` : ": void";
+            const returnType = func.returnType ? `${func.returnType}` : "void";
+
+            if (objectType) {
+                render += `    ${name}(${params.join(", ")}): ${returnType},\n`;
+                return
+            }
 
             if (!globalFn)
-                render += `    ${isStatic ? "static " : ""}${name}(${params.join(", ")})${returnType};\n`;
+                render += `    ${isStatic ? "static " : ""}${name}(${params.join(", ")}): ${returnType};\n`;
             else {
                 exportDefs.add(name);
                 render += `export function ${name}(${params.join(", ")}): ${func.returnType ?? "void"};\n`;
@@ -572,6 +669,20 @@ export function process(path: string[]) {
             renderFunction(func, true)
         })
 
+        statements.filter(x => x.type === "DeclareObjectStatement").forEach(decl => {
+            const funcs = statements.filter(x => x.type === "FunctionStatement" && (x.name.startsWith(decl.name + ":") || x.name.startsWith(decl.name + ".")));
+
+            if (!funcs.length) {
+                render += `declare const ${decl.name} = any;\n`
+                return
+            }
+            render += `declare const ${decl.name}: {\n`
+            funcs.forEach(func => {
+                renderFunction(func, false, true);
+            });
+            render += "}\n\n"
+        })
+
         // Classes
         statements.filter(x => x.type === "ClassStatement").forEach(cls => {
             exportDefs.add(cls.name);
@@ -598,6 +709,11 @@ export function process(path: string[]) {
             render += `}\n\n`
         })
 
+        statements.filter(x => x.type === "ExportStatement").forEach(exportStmt => {
+            if (exportStmt.type !== "ExportStatement") return
+            render += `export default ${exportStmt.name};\n\n`
+        })
+
         render = `/**\n ** UE4TS generated file\n*/\n\n\n` + render
 
 
@@ -606,30 +722,47 @@ export function process(path: string[]) {
 
         // Deno.writeTextFileSync("./debug.output.d.ts", render)
 
-        return { path: p, statements, exportDefs, usedTypes, foreignTypes, notFound: new Set<string>(), render, imports: new Map<string, string[]>() };
-    });
+        return { path: p, statements, exportDefs, usedTypes, foreignTypes, notFound: new Set<string>(), render, imports: new Map<string, string[]>(), sourceString, skip: false };
+    }));
+
+    const results = resultsUnfiltered.filter(x => !x.skip)
 
     // Add imports for foreign types
     results.forEach(result => {
-        result.foreignTypes.forEach(type => {
+        result.foreignTypes?.forEach(type => {
             // Find a result that exports this type
-            const foreign = results.find(r => r.exportDefs.has(type));
+            const foreign = results.find(r => r.exportDefs?.has(type));
             if (foreign) {
                 if (!result.imports.has(foreign.path)) {
                     result.imports.set(foreign.path, []);
                 }
                 result.imports.get(foreign.path)?.push(type);
             } else {
-                result.notFound.add(type);
-                console.warn(`Foreign type ${type} not found in any result.`);
+                const metaEntries = metadataHandler.findExport(type);
+                if (metaEntries.length > 0) {
+                    // If we have metadata, we can use it to find the path
+                    const metaEntry = metaEntries[0];
+                    const path = metaEntry.path;
+                    if (!result.imports.has(path)) {
+                        result.imports.set(path, []);
+                    }
+                    result.imports.get(path)?.push(type);
+                } else {
+                    // If no result exports this type, add it to notFound
+                    result.notFound.add(type);
+                    console.warn(`Foreign type ${type} not found in any result.`);
+                }
             }
         });
 
         // If there are not found types, declare them with unknown
-        if (result.notFound.size > 0) {
+        if (result.notFound!.size > 0) {
             result.render += "// Unresolved dependencies\n";
             [...result.notFound].forEach(type => {
-                result.render += `export type ${type} = unknown;\n`
+                if (FALLBACK_DEFS[type]) {
+                    result.render += `${FALLBACK_DEFS[type]}\n`;
+                } else
+                    result.render += `type ${type} = unknown;\n`
             })
             result.render += "// -------------\n\n"
         }
@@ -642,7 +775,7 @@ export function process(path: string[]) {
             const importFilePath = "./output/" + path.replace(/^[a-zA-Z]:[\\/]/, "").replace(/\\/g, "/").replace(/\.lua$/, ".d.ts");
             let relPath = relative(outputDir, importFilePath).replaceAll("\\", "/");
             if (!relPath.startsWith(".")) relPath = "./" + relPath;
-            return `import { ${types.join(", ")} } from "${relPath}";`;
+            return `import type { ${types.join(", ")} } from "${relPath}";`;
         }).join("\n");
         result.render = imports + (imports ? "\n\n" : "") + result.render;
     });
@@ -653,17 +786,24 @@ export function process(path: string[]) {
         // Ensure the output directory exists
         const outputDir = outputPath.substring(0, outputPath.lastIndexOf("/"));
         Deno.mkdirSync(outputDir, { recursive: true });
-        Deno.writeTextFileSync(outputPath, result.render);
-        console.log(`Generated ${outputPath} with ${result.statements.length} statements and ${result.usedTypes.length} used types.`);
+        Deno.writeTextFileSync(outputPath, result.render!);
+        console.log(`Generated ${outputPath} with ${result.statements!.length} statements and ${result.usedTypes!.length} used types.`);
     });
 
     // Generate meta json
-    Deno.writeTextFileSync("./output/meta.json", JSON.stringify(results.map(result => ({
-        path: result.path,
-        imports: result.foreignTypes.join(", "),
-        missingDeps: [...result.notFound].join(", "),
-        exports: [...result.exportDefs].join(", "),
-    })), null, 2))
+
+    await Promise.all(results.map(async (result) => {
+        return metadataHandler.update({
+            path: result.path,
+            imports: result.foreignTypes!,
+            missingDeps: [...result.notFound!],
+            exports: [...result.exportDefs!],
+            fnHash: await generateFnHash(result.path),
+            fcHash: await generateFcHash(result.path, result.sourceString!),
+        });
+    }));
+
+    metadataHandler.save()
 
 
     console.log("Done")
@@ -671,7 +811,13 @@ export function process(path: string[]) {
     return {};
 }
 
-// console.log(process(["./debug.test.lua"]))
-console.log(process(["./shared/**/*.lua"]))
+
+
+console.log(process(["./**/*.lua"]))
+
+
+// console.log(process(["./shared/**/*.lua"]))
+
+
 
 // setInterval(() => { }, 50000)

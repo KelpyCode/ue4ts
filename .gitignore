@@ -2,3 +2,4 @@ shared/*
 tstypes/*
 types
 debug.*
+output/*
